@@ -5,10 +5,12 @@ const {
   registerUser,
   loginUser,
   logoutUser,
+  getCurrentUser,
 } = require('../controllers/auth.controller');
 
 router.post('/register', registerUser);
 router.post('/login', loginUser);
-router.get('/logout', logoutUser);
+router.post('/logout', logoutUser);
+router.get('/current-user', getCurrentUser);
 
 module.exports = router;

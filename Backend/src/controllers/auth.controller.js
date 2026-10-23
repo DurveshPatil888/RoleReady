@@ -8,10 +8,11 @@ const generateTokenAndSetCookie = (res, userId) => {
   });
 
   res.cookie('token', token, {
-    httpOnly: true, // It saves froms XSS attacks (frontend js cannot access this cookie)
+    httpOnly: true,
     secure: process.env.NODE_ENV === 'production',
-    sameSite: 'strict', // Its saves from CSRF attacks (its prevents other sites from making requests to your site)
-    maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+    sameSite: 'strict',
+    maxAge: 30 * 24 * 60 * 60 * 1000,
+    path: '/',
   });
 };
 
@@ -78,11 +79,35 @@ const loginUser = async (req, res) => {
 const logoutUser = (req, res) => {
   res.clearCookie('token', {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production', // NODE_ENV means - have 2 optuons: development or production. devlopment means local development. production means live environment.
+    secure: process.env.NODE_ENV === 'production',
     sameSite: 'strict',
+    path: '/',
   });
 
   res.status(200).json({ message: 'Logged out successfully' });
 };
 
-module.exports = { registerUser, loginUser, logoutUser };
+const getCurrentUser = async (req, res) => {
+  try {
+    const token = req.cookies.token;
+
+    if (!token) {
+      return res.status(401).json({ message: 'Token Not Found' });
+    }
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    const user = await UserModel.findById(decoded.id).select('-password');
+
+    if (!user) {
+      return res.status(404).json({ message: 'User DB me nahi mila!' });
+    }
+
+    res.status(200).json(user);
+  } catch (error) {
+    console.error('GetCurrentUser Error:', error.message);
+    res.status(500).json({ message: 'Invalid token ya server error!' });
+  }
+};
+
+module.exports = { registerUser, loginUser, logoutUser, getCurrentUser };

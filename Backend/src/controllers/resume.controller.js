@@ -1,71 +1,94 @@
-// const pdfParse = require('pdf-extraction');
-
-// const parseResume = async (req, res) => {
-//   try {
-//     if (!req.file) {
-//       return res.status(400).json({ message: 'Please upload a PDF file' });
-//     }
-
-//     // Ye ab 100% chalega bina kisi error ke
-//     const pdfData = await pdfParse(req.file.buffer);
-//     const extractedText = pdfData.text;
-
-//     if (!extractedText) {
-//       return res.status(400).json({ message: 'No text found in the PDF' });
-//     }
-
-//     res.status(200).json({
-//       message: 'PDF parsed successfully',
-//       text: extractedText,
-//     });
-//   } catch (error) {
-//     console.error('PDF Parsing Error:', error);
-//     res
-//       .status(500)
-//       .json({ message: 'Error parsing PDF', error: error.message });
-//   }
-// };
-
-// module.exports = { parseResume };
-
 const pdfParse = require('pdf-extraction');
-const Resume = require('../models/resume.model'); // Tumhara MongoDB Schema
+const Resume = require('../models/resume.model');
+const { extractLinks, applyLinks } = require('../../src/utils/pdfLinks');
 const {
   generateResumeJSON,
   tailorResumeWithAI,
-} = require('../services/ai.service'); // Tumhari AI aur Zod service
+  generateResumePdf,
+} = require('../services/ai.service');
 
 const parseResume = async (req, res) => {
   try {
-    // 1. File Check
     if (!req.file) {
       return res.status(400).json({ message: 'Please upload a PDF file' });
     }
 
-    // 2. PDF se Text Extract karna
     const pdfData = await pdfParse(req.file.buffer);
+
     const extractedText = pdfData.text;
 
     if (!extractedText) {
       return res.status(400).json({ message: 'No text found in the PDF' });
     }
 
-    // 3. AI Service ko call karna taaki JSON mile (Zod validated)
+    const links = await extractLinks(req.file.buffer);
+    console.log('LINKS FOUND:', links);
+
     const aiGeneratedData = await generateResumeJSON(extractedText);
 
-    // 4. MongoDB me Nayi Entry banana (Isse automatically nayi _id generate hogi)
-    const newResume = new Resume({
-      userId: req.user._id, // Auth middleware se logged-in user ki ID
-      ...aiGeneratedData, // AI ka diya hua poora data isme chipka diya
-    });
+    if (!Array.isArray(aiGeneratedData.experience)) {
+      aiGeneratedData.experience =
+        typeof aiGeneratedData.experience === 'string'
+          ? [
+              {
+                title: aiGeneratedData.experience,
+                company: '',
+                description: [aiGeneratedData.experience],
+              },
+            ]
+          : [];
+    } else {
+      aiGeneratedData.experience = aiGeneratedData.experience.map((exp) => {
+        if (typeof exp === 'string') {
+          return { title: exp, company: '', description: [exp] };
+        }
+        return exp;
+      });
+    }
 
-    // Database me save kar diya
-    const savedResume = await newResume.save();
+    // Projects check: Agar array nahi hai, toh safe handle karo
+    if (!Array.isArray(aiGeneratedData.projects)) {
+      aiGeneratedData.projects =
+        typeof aiGeneratedData.projects === 'string'
+          ? [
+              {
+                title: aiGeneratedData.projects,
+                description: [aiGeneratedData.projects],
+              },
+            ]
+          : [];
+    } else {
+      aiGeneratedData.projects = aiGeneratedData.projects.map((proj) => {
+        if (typeof proj === 'string') {
+          return { title: proj, description: [proj] };
+        }
+        return proj;
+      });
+    }
 
-    // 5. Frontend/Postman ko response bhejna
-    res.status(201).json({
-      message: 'New Master Resume created and saved successfully!',
-      resumeId: savedResume._id, // Ye rahi wo nayi specific ID!
+    if (!Array.isArray(aiGeneratedData.education)) {
+      aiGeneratedData.education =
+        typeof aiGeneratedData.education === 'string'
+          ? [{ degree: aiGeneratedData.education, institution: '' }]
+          : [];
+    } else {
+      aiGeneratedData.education = aiGeneratedData.education.map((edu) => {
+        if (typeof edu === 'string') {
+          return { degree: edu, institution: '' };
+        }
+        return edu;
+      });
+    }
+    applyLinks(aiGeneratedData, links);
+    const savedResume = await Resume.findOneAndUpdate(
+      { userId: req.user._id, isMaster: true },
+      { $set: { ...aiGeneratedData, isMaster: true, userId: req.user._id } },
+      { returnDocument: 'after', upsert: true }
+    );
+
+    res.status(200).json({
+      message: 'Master Resume updated successfully!',
+      resumeId: savedResume._id,
       data: savedResume,
     });
   } catch (error) {
@@ -80,14 +103,12 @@ const tailorResume = async (req, res) => {
   try {
     const { resumeId, jobDescription } = req.body;
 
-    // 1. Validation: Check karo ki dono cheezein aayi hain ya nahi
     if (!resumeId || !jobDescription) {
       return res
         .status(400)
         .json({ message: 'resumeId and jobDescription are required' });
     }
 
-    // 2. MongoDB se tumhara Master Resume dhoondhna! (Ye raha tumhara answer)
     const masterResume = await Resume.findById(resumeId);
 
     if (!masterResume) {
@@ -96,18 +117,43 @@ const tailorResume = async (req, res) => {
         .json({ message: 'Master resume not found in database' });
     }
 
-    // 3. AI Service ko call karna (Master Resume aur JD dono bhej diye)
-    const tailoredData = await tailorResumeWithAI(masterResume, jobDescription);
+    const tailoredData = await tailorResumeWithAI(
+      masterResume.toObject(),
+      jobDescription
+    );
 
-    // 4. Tailored Resume ko ek nayi ID ke sath save karna (Master ko touch nahi kiya)
+    const m = masterResume.toObject();
+    const norm = (s = '') => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+    tailoredData.personalInfo = {
+      ...tailoredData.personalInfo,
+      ...m.personalInfo,
+    };
+
+    tailoredData.projects = (tailoredData.projects || []).map((p) => {
+      const orig = (m.projects || []).find(
+        (o) => norm(o.title) === norm(p.title)
+      );
+      return orig
+        ? {
+            ...p,
+            liveLink: orig.liveLink || '',
+            githubLink: orig.githubLink || '',
+          }
+        : p;
+    });
+
+    delete tailoredData._id;
+    delete tailoredData.id;
+
     const newTailoredResume = new Resume({
       userId: req.user._id,
       ...tailoredData,
+      isMaster: false,
     });
 
     const savedTailoredResume = await newTailoredResume.save();
 
-    // 5. Frontend ko success response dena
     res.status(200).json({
       message: 'Resume tailored successfully for the JD!',
       tailoredResumeId: savedTailoredResume._id,
@@ -121,4 +167,85 @@ const tailorResume = async (req, res) => {
   }
 };
 
-module.exports = { parseResume, tailorResume };
+const getUserResumes = async (req, res) => {
+  try {
+    const resumes = await Resume.find({ userId: req.user._id }).sort({
+      updatedAt: -1,
+    });
+
+    res.status(200).json({
+      message: 'Resumes fetched successfully',
+      count: resumes.length,
+      data: resumes,
+    });
+  } catch (error) {
+    console.error('Error fetching resumes:', error);
+    res
+      .status(500)
+      .json({ message: 'Error fetching resumes', error: error.message });
+  }
+};
+
+const getResumeById = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const resume = await Resume.findOne({ _id: id, userId: req.user._id });
+
+    if (!resume) {
+      return res.status(404).json({ message: 'Resume not found' });
+    }
+
+    res.status(200).json(resume);
+  } catch (error) {
+    console.error('Error fetching resume by ID:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+const downloadResumePdf = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const resume = await Resume.findOne({ _id: id, userId: req.user._id });
+
+    if (!resume) {
+      return res.status(404).json({ message: 'Resume not found' });
+    }
+
+    console.log('DOWNLOAD ID:', id);
+    console.log('isMaster:', resume.isMaster);
+    console.log('SUMMARY:', resume.summary);
+
+    const pdfBuffer = await generateResumePdf(
+      resume.toObject(),
+      resume.targetRole
+    );
+
+    const fileName =
+      `${resume.personalInfo?.fullName || 'Resume'}_${resume.targetRole || 'Master'}.pdf`.replace(
+        /\s+/g,
+        '_'
+      );
+
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename="${fileName}"`,
+      'Content-Length': pdfBuffer.length,
+    });
+
+    res.send(pdfBuffer);
+  } catch (error) {
+    console.error('Download PDF Error:', error);
+    res
+      .status(500)
+      .json({ message: 'Error generating PDF', error: error.message });
+  }
+};
+
+module.exports = {
+  parseResume,
+  tailorResume,
+  getUserResumes,
+  getResumeById,
+  downloadResumePdf,
+};
